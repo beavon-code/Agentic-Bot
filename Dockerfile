@@ -1,4 +1,4 @@
-FROM dhi.io/python:3-alpine-sfw-ent-dev
+FROM python:3.14.7-trixie
 
 # Prevent python cache files and enable immediate container logs
 ENV PYTHONDONTWRITEBYTECODE=1

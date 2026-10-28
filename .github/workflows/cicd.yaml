@@ -1,168 +1,92 @@
-name: CI/CD - Docker Hub and AWS ECS Fargate (Self-hosted Runner)
+name: CI/CD - Streamlit on EC2 (self-hosted runner)
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  id-token: write
-
-concurrency:
-  group: agentic-chatbot-deploy-${{ github.ref }}
-  cancel-in-progress: false
+  pull_request:
+    branches: [main]
 
 env:
-  AWS_REGION: REPLACE_WITH_YOUR_AWS_REGION
-  DOCKERHUB_IMAGE: REPLACE_WITH_DOCKERHUB_USERNAME/agentic-chatbot
-  ECS_CLUSTER: REPLACE_WITH_EXISTING_ECS_CLUSTER_NAME
-  ECS_SERVICE: REPLACE_WITH_EXISTING_ECS_SERVICE_NAME
-  ECS_TASK_DEFINITION: .aws/task-definition.json
-  CONTAINER_NAME: agentic-chatbot
+  IMAGE_NAME: agentic-bot
+  CONTAINER_NAME: agentic-bot
 
 jobs:
-  build-push-deploy:
-    name: Build, push, and deploy
-    # Assumes the self-hosted runner has Linux and x64 labels.
-    runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 45
-
+  test:
+    runs-on: self-hosted
     steps:
-      - name: Check out source code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Verify runner tools
-        shell: bash
+      # Runs inside a Python container so the runner needs no Python install
+      - name: Lint and test
         run: |
-          python3 --version
-          docker --version
-          aws --version
-          docker info
+          docker run --rm -v "$PWD":/app -w /app python:3.11-slim bash -c '
+            pip install -q -r requirements.txt pytest flake8 &&
+            flake8 . --max-line-length=120 --exclude=.git,__pycache__,venv &&
+            (pytest || [ $? -eq 5 ])   # exit code 5 = no tests collected
+          '
 
-      - name: Install dependencies and check Python syntax
-        shell: bash
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
         run: |
-          python3 -m pip install --upgrade pip
-          test -f requirements.txt
-          python3 -m pip install -r requirements.txt
-          python3 -m compileall -q .
+          docker build \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.DOCKERHUB_IMAGE }}:latest
-            ${{ env.DOCKERHUB_IMAGE }}:${{ github.sha }}
-
-      - name: Configure AWS credentials using GitHub OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: GitHubActionsAgenticChatbot
-
-      - name: Update application environment secret in AWS Secrets Manager
+      # Secrets come from GitHub Secrets; non-secret settings come from GitHub Variables
+      # (with defaults). They go through env: so secrets stay masked in logs.
+      - name: Create env file
         env:
-          AWS_APP_ENV_SECRET_ARN: ${{ secrets.AWS_APP_ENV_SECRET_ARN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-          LANGSMITH_TRACING: ${{ secrets.LANGSMITH_TRACING }}
-          LANGSMITH_ENDPOINT: ${{ secrets.LANGSMITH_ENDPOINT }}
           LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
-          LANGSMITH_PROJECT: ${{ secrets.LANGSMITH_PROJECT }}
-        shell: bash
+          LANGSMITH_TRACING: ${{ vars.LANGSMITH_TRACING || 'true' }}
+          LANGSMITH_ENDPOINT: ${{ vars.LANGSMITH_ENDPOINT || 'https://api.smith.langchain.com' }}
+          LANGSMITH_PROJECT: ${{ vars.LANGSMITH_PROJECT }}
         run: |
-          set -euo pipefail
-          test -n "$AWS_APP_ENV_SECRET_ARN"
+          umask 077
+          {
+            printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY"
+            printf 'GROQ_API_KEY=%s\n' "$GROQ_API_KEY"
+            printf 'TAVILY_API_KEY=%s\n' "$TAVILY_API_KEY"
+            printf 'LANGSMITH_API_KEY=%s\n' "$LANGSMITH_API_KEY"
+            printf 'LANGSMITH_TRACING=%s\n' "$LANGSMITH_TRACING"
+            printf 'LANGSMITH_ENDPOINT=%s\n' "$LANGSMITH_ENDPOINT"
+            printf 'LANGSMITH_PROJECT=%s\n' "$LANGSMITH_PROJECT"
+          } > "$RUNNER_TEMP/app.env"
 
-          SECRET_FILE="$(mktemp)"
-          trap 'rm -f "$SECRET_FILE"' EXIT
-          chmod 600 "$SECRET_FILE"
-          export SECRET_FILE
-
-          python3 - <<'PY'
-          import json
-          import os
-
-          keys = [
-              "DEEPSEEK_API_KEY",
-              "GROQ_API_KEY",
-              "TAVILY_API_KEY",
-              "LANGSMITH_TRACING",
-              "LANGSMITH_ENDPOINT",
-              "LANGSMITH_API_KEY",
-              "LANGSMITH_PROJECT",
-          ]
-          missing = [key for key in keys if not os.environ.get(key)]
-          if missing:
-              raise SystemExit("Missing GitHub Actions secrets: " + ", ".join(missing))
-
-          with open(os.environ["SECRET_FILE"], "w", encoding="utf-8") as f:
-              json.dump({key: os.environ[key] for key in keys}, f)
-          PY
-
-          aws secretsmanager put-secret-value \
-            --secret-id "$AWS_APP_ENV_SECRET_ARN" \
-            --secret-string "file://$SECRET_FILE" \
-            --region "$AWS_REGION" \
-            --query ARN \
-            --output text
-
-      - name: Prepare task definition without modifying repository file
-        env:
-          AWS_APP_ENV_SECRET_ARN: ${{ secrets.AWS_APP_ENV_SECRET_ARN }}
-        shell: bash
+      - name: agentic-bot
         run: |
-          set -euo pipefail
-          export SOURCE_TASK_DEFINITION="$ECS_TASK_DEFINITION"
-          export RENDER_TASK_DEFINITION="$RUNNER_TEMP/task-definition.json"
+          docker stop ${{ env.CONTAINER_NAME }} || true
+          docker rm ${{ env.CONTAINER_NAME }} || true
+          docker run -d \
+            --name ${{ env.CONTAINER_NAME }} \
+            --restart unless-stopped \
+            -p 80:8501 \
+            --env-file "$RUNNER_TEMP/app.env" \
+            ${{ env.IMAGE_NAME }}:latest
 
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
+      - name: Remove env file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/app.env"
 
-          source = Path(os.environ["SOURCE_TASK_DEFINITION"])
-          target = Path(os.environ["RENDER_TASK_DEFINITION"])
-          arn = os.environ.get("AWS_APP_ENV_SECRET_ARN", "")
+      - name: Health check
+        run: |
+          for i in $(seq 1 15); do
+            if curl -fs http://localhost:80/_stcore/health; then
+              echo "App is healthy"
+              exit 0
+            fi
+            sleep 3
+          done
+          docker logs ${{ env.CONTAINER_NAME }}
+          exit 1
 
-          if not arn.startswith("arn:"):
-              raise SystemExit("AWS_APP_ENV_SECRET_ARN must be a full Secrets Manager ARN.")
-
-          task = json.loads(source.read_text(encoding="utf-8"))
-          for container in task.get("containerDefinitions", []):
-              for secret in container.get("secrets", []):
-                  value = secret.get("valueFrom", "")
-                  placeholder = "REPLACE_WITH_APP_ENV_SECRET_ARN"
-                  if placeholder in value:
-                      secret["valueFrom"] = value.replace(placeholder, arn)
-
-          target.write_text(json.dumps(task, indent=2), encoding="utf-8")
-          print(f"Prepared task definition at {target}")
-          PY
-
-      - name: Render task definition with the new image
-        id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: ${{ runner.temp }}/task-definition.json
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ env.DOCKERHUB_IMAGE }}:${{ github.sha }}
-
-      - name: Deploy to existing ECS service
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          service: ${{ env.ECS_SERVICE }}
-          wait-for-service-stability: true
+      - name: Clean up old images
+        run: docker image prune -f
