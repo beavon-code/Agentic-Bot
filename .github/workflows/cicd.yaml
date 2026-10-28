@@ -1,92 +1,88 @@
-name: CI/CD - Streamlit on EC2 (self-hosted runner)
+name: CI/CD - Agentic Chatbot
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentic-chatbot-deploy
+  cancel-in-progress: false
 
 env:
-  IMAGE_NAME: agentic-bot
-  CONTAINER_NAME: agentic-bot
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: agentic-chatbot
+  ECS_CLUSTER: agentic-chatbot-cluster
+  ECS_SERVICE: agentic-chatbot-service
+  ECS_TASK_DEFINITION: task-definition.json
+  CONTAINER_NAME: agentic-chatbot
 
 jobs:
-  test:
-    runs-on: self-host
-    steps:
-      - uses: actions/checkout@v4
-
-      # Runs inside a Python container so the runner needs no Python install
-      - name: Lint and test
-        run: |
-          docker run --rm -v "$PWD":/app -w /app python:3.11-slim bash -c '
-            pip install -q -r requirements.txt pytest flake8 &&
-            flake8 . --max-line-length=120 --exclude=.git,__pycache__,venv &&
-            (pytest || [ $? -eq 5 ])   # exit code 5 = no tests collected
-          '
-
-  deploy:
-    needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  build-and-deploy:
+    name: Build and Deploy
     runs-on: self-hosted
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Build image
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies and check Python syntax
         run: |
-          docker build \
-            -t ${{ env.IMAGE_NAME }}:latest \
-            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m compileall -q app.py backend.py
 
-      # Secrets come from GitHub Secrets; non-secret settings come from GitHub Variables
-      # (with defaults). They go through env: so secrets stay masked in logs.
-      - name: Create env file
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify required tools and task definition
+        run: |
+          docker --version
+          aws --version
+          jq --version
+          test -f task-definition.json
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: image
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
-          LANGSMITH_TRACING: ${{ vars.LANGSMITH_TRACING || 'true' }}
-          LANGSMITH_ENDPOINT: ${{ vars.LANGSMITH_ENDPOINT || 'https://api.smith.langchain.com' }}
-          LANGSMITH_PROJECT: ${{ vars.LANGSMITH_PROJECT }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          umask 077
-          {
-            printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY"
-            printf 'GROQ_API_KEY=%s\n' "$GROQ_API_KEY"
-            printf 'TAVILY_API_KEY=%s\n' "$TAVILY_API_KEY"
-            printf 'LANGSMITH_API_KEY=%s\n' "$LANGSMITH_API_KEY"
-            printf 'LANGSMITH_TRACING=%s\n' "$LANGSMITH_TRACING"
-            printf 'LANGSMITH_ENDPOINT=%s\n' "$LANGSMITH_ENDPOINT"
-            printf 'LANGSMITH_PROJECT=%s\n' "$LANGSMITH_PROJECT"
-          } > "$RUNNER_TEMP/app.env"
+          set -e
+          IMAGE_URI="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
 
-      - name: agentic-bot
-        run: |
-          docker stop ${{ env.CONTAINER_NAME }} || true
-          docker rm ${{ env.CONTAINER_NAME }} || true
-          docker run -d \
-            --name ${{ env.CONTAINER_NAME }} \
-            --restart unless-stopped \
-            -p 80:8501 \
-            --env-file "$RUNNER_TEMP/app.env" \
-            ${{ env.IMAGE_NAME }}:latest
+      - name: Render ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.image.outputs.uri }}
 
-      - name: Remove env file
-        if: always()
-        run: rm -f "$RUNNER_TEMP/app.env"
-
-      - name: Health check
-        run: |
-          for i in $(seq 1 15); do
-            if curl -fs http://localhost:80/_stcore/health; then
-              echo "App is healthy"
-              exit 0
-            fi
-            sleep 3
-          done
-          docker logs ${{ env.CONTAINER_NAME }}
-          exit 1
-
-      - name: Clean up old images
-        run: docker image prune -f
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
